@@ -1,0 +1,108 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# claude — launcher wrapper: auto-update + self-healing rollback + DNS fix
+VERSIONS_DIR="/data/data/com.termux/files/home/.local/share/claude/versions"
+GLIBC_LD="/data/data/com.termux/files/usr/glibc/lib/ld-linux-aarch64.so.1"
+PATCHELF="/data/data/com.termux/files/usr/glibc/bin/patchelf"
+STAMP="$VERSIONS_DIR/.last-update-check"
+BLOCKLIST="$VERSIONS_DIR/.blocklist"
+VERIFIED="$VERSIONS_DIR/.verified"
+RATE_LIMIT=86400
+
+CC_SETDNS="/data/data/com.termux/files/home/.local/share/claude/setdns.js"
+CC_SETDNS_JS='try { require("dns").setServers(["8.8.8.8", "8.8.4.4"]); } catch (e) {}'
+write_setdns() {
+  [ -s "$1" ] && return 0
+  printf '%s\n' "$CC_SETDNS_JS" > "$1" 2>/dev/null
+}
+
+force_update=0
+args=()
+for a in "$@"; do
+  if [ "$a" = "--update-now" ]; then
+    force_update=1
+  else
+    args+=("$a")
+  fi
+done
+
+should_check=0
+if [ "$force_update" = 1 ]; then
+  should_check=1
+elif [ ! -f "$STAMP" ]; then
+  should_check=1
+else
+  now=$(date +%s)
+  last=$(stat -c%Y "$STAMP" 2>/dev/null || echo 0)
+  [ $((now - last)) -ge $RATE_LIMIT ] && should_check=1
+fi
+
+if [ "$should_check" = 1 ]; then
+  latest=$(curl -fsSL --max-time 5 https://registry.npmjs.org/@anthropic-ai/claude-code/latest 2>/dev/null | jq -r .version 2>/dev/null || echo "")
+  if [ -n "$latest" ] && printf '%s' "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    new_bin="$VERSIONS_DIR/$latest"
+    if [ ! -f "$new_bin" ] && ! grep -qxF "$latest" "$BLOCKLIST" 2>/dev/null; then
+      dl="https://downloads.claude.ai/claude-code-releases/$latest"
+      if curl -fsSL --max-time 300 "$dl/linux-arm64/claude" -o "$new_bin.tmp" 2>/dev/null; then
+        exp=$(curl -fsSL --max-time 5 "$dl/manifest.json" 2>/dev/null | jq -er '.platforms["linux-arm64"].checksum' 2>/dev/null || echo "")
+        act=$(sha256sum "$new_bin.tmp" | cut -d' ' -f1)
+        if [ -n "$exp" ] && [ "$exp" = "$act" ]; then
+          chmod +x "$new_bin.tmp"
+          if LD_PRELOAD= "$PATCHELF" --set-interpreter "$GLIBC_LD" "$new_bin.tmp" 2>/dev/null; then
+            if HOME="$HOME" LD_PRELOAD= timeout -s KILL 25 "$new_bin.tmp" --init-only </dev/null >/dev/null 2>&1; then
+              mv "$new_bin.tmp" "$new_bin"
+              printf '%s\n' "$latest" > "$VERIFIED"
+              prev=$(ls -1 "$VERSIONS_DIR" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -2 | head -1)
+              for old in "$VERSIONS_DIR"/*; do
+                base=$(basename "$old")
+                [ -f "$old" ] && [ "$base" != "$latest" ] && [ "$base" != "$prev" ] && rm -f "$old"
+              done
+            else
+              rm -f "$new_bin.tmp"
+              printf '%s\n' "$latest" >> "$BLOCKLIST"
+              echo "[claude] update: $latest crashes on launch (failed smoke test), keeping cached" >&2
+            fi
+          else
+            rm -f "$new_bin.tmp"
+            echo "[claude] update: patchelf failed on $latest, using cached" >&2
+          fi
+        else
+          rm -f "$new_bin.tmp"
+          echo "[claude] update: checksum mismatch on $latest, using cached" >&2
+        fi
+      else
+        echo "[claude] update: download failed, using cached" >&2
+      fi
+    fi
+  else
+    echo "[claude] update: could not query npm registry, using cached" >&2
+  fi
+  touch "$STAMP"
+fi
+
+verified=$(cat "$VERIFIED" 2>/dev/null || echo "")
+bin=""
+for cand in $(ls -1 "$VERSIONS_DIR" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr); do
+  grep -qxF "$cand" "$BLOCKLIST" 2>/dev/null && continue
+  cpath="$VERSIONS_DIR/$cand"
+  [ -f "$cpath" ] || continue
+  if [ "$cand" = "$verified" ]; then bin="$cpath"; break; fi
+  interp=$(LD_PRELOAD= "$PATCHELF" --print-interpreter "$cpath" 2>/dev/null || echo unknown)
+  [ "$interp" = "$GLIBC_LD" ] || LD_PRELOAD= "$PATCHELF" --set-interpreter "$GLIBC_LD" "$cpath" 2>/dev/null
+  if HOME="$HOME" LD_PRELOAD= timeout -s KILL 25 "$cpath" --init-only </dev/null >/dev/null 2>&1; then
+    printf '%s\n' "$cand" > "$VERIFIED"
+    bin="$cpath"
+    break
+  else
+    echo "[claude] $cand crashes on this device; rolling back to the previous version" >&2
+    printf '%s\n' "$cand" >> "$BLOCKLIST"
+  fi
+done
+if [ -z "$bin" ]; then
+  echo "[claude] no working claude binary found in $VERSIONS_DIR. Re-run install.sh." >&2
+  exit 1
+fi
+
+write_setdns "$CC_SETDNS"
+[ -s "$CC_SETDNS" ] && export BUN_OPTIONS="--preload $CC_SETDNS${BUN_OPTIONS:+ $BUN_OPTIONS}"
+unset LD_PRELOAD
+exec "$bin" "${args[@]}"
